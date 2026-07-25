@@ -21,6 +21,7 @@ export {
   type HourlyCacheStats,
   type RedisHourlyStatsPluginOptions,
   type TableCacheStats,
+  type WindowCacheStats,
 } from './drizzle-redis-cache';
 
 export {

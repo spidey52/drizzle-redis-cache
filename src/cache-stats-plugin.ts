@@ -15,12 +15,18 @@ export type TableCacheStats = {
   hitRate: number;
 };
 
+export type WindowCacheStats = {
+  stats: HourlyCacheStats[];
+  tableStats: TableCacheStats[];
+};
+
 export interface CacheStatsCollector {
   recordHit(tables?: string[]): void;
   recordMiss(tables?: string[]): void;
   flush(): Promise<void>;
   getHourlyStats(hours?: number): Promise<HourlyCacheStats[]>;
-  getTableStats?(): Promise<TableCacheStats[]>;
+  getTableStats?(hours?: number): Promise<TableCacheStats[]>;
+  getWindowStats?(hours?: number): Promise<WindowCacheStats>;
   destroy(): Promise<void>;
 }
 
@@ -31,6 +37,9 @@ export type RedisHourlyStatsPluginOptions = {
   /** Bucket retention in seconds (default 14 days). */
   retentionSeconds?: number;
 };
+
+const TABLE_HIT_PREFIX = 'th:';
+const TABLE_MISS_PREFIX = 'tm:';
 
 /** Optional plugin: local counters → Redis hourly buckets (local timezone). */
 export class RedisHourlyStatsPlugin implements CacheStatsCollector {
@@ -55,14 +64,6 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
     return `${this.namespace}:stats:${hour}`;
   }
 
-  private tableStatsKey(table: string): string {
-    return `${this.namespace}:table_stats:${table}`;
-  }
-
-  private tableIndexKey(): string {
-    return `${this.namespace}:meta:table_stats_index`;
-  }
-
   private hourBucket(date = new Date()): string {
     const y = date.getFullYear();
     const m = String(date.getMonth() + 1).padStart(2, '0');
@@ -82,6 +83,10 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
     const sign = offsetMin >= 0 ? '+' : '-';
     const abs = Math.abs(offsetMin);
     return `${y}-${pad(m)}-${pad(d)}T${pad(h)}:00:00${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+  }
+
+  private clampHours(hours: number): number {
+    return Math.max(1, Math.min(hours, 24 * 31));
   }
 
   private recentHours(count: number): string[] {
@@ -130,20 +135,16 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
       const pipeline = this.redis.pipeline();
       if (hits > 0) pipeline.hincrby(key, 'hits', hits);
       if (misses > 0) pipeline.hincrby(key, 'misses', misses);
-      pipeline.expire(key, this.retentionSeconds);
 
       const tables = new Set([...tableHits.keys(), ...tableMisses.keys()]);
       for (const table of tables) {
-        const tKey = this.tableStatsKey(table);
         const th = tableHits.get(table) ?? 0;
         const tm = tableMisses.get(table) ?? 0;
-        if (th > 0) pipeline.hincrby(tKey, 'hits', th);
-        if (tm > 0) pipeline.hincrby(tKey, 'misses', tm);
-        pipeline.expire(tKey, this.retentionSeconds);
-        pipeline.sadd(this.tableIndexKey(), table);
+        if (th > 0) pipeline.hincrby(key, `${TABLE_HIT_PREFIX}${table}`, th);
+        if (tm > 0) pipeline.hincrby(key, `${TABLE_MISS_PREFIX}${table}`, tm);
       }
-      if (tables.size > 0) pipeline.expire(this.tableIndexKey(), this.retentionSeconds);
 
+      pipeline.expire(key, this.retentionSeconds);
       await pipeline.exec();
     } catch {
       this.hits += hits;
@@ -153,15 +154,25 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
     }
   }
 
-  async getHourlyStats(hours = 24): Promise<HourlyCacheStats[]> {
-    await this.flush();
-    const buckets = this.recentHours(Math.max(1, Math.min(hours, 24 * 31)));
+  /** Pipelined HGETALL for the last N hour buckets. */
+  private async loadHourlyRows(
+    hours: number,
+  ): Promise<Array<{ hour: string; row: Record<string, string> }>> {
+    const buckets = this.recentHours(this.clampHours(hours));
     const pipeline = this.redis.pipeline();
     for (const hour of buckets) pipeline.hgetall(this.statsKey(hour));
     const results = await pipeline.exec();
 
-    return buckets.map((hour, i) => {
-      const row = (results?.[i]?.[1] ?? {}) as Record<string, string>;
+    return buckets.map((hour, i) => ({
+      hour,
+      row: (results?.[i]?.[1] ?? {}) as Record<string, string>,
+    }));
+  }
+
+  private toHourlyStats(
+    rows: Array<{ hour: string; row: Record<string, string> }>,
+  ): HourlyCacheStats[] {
+    return rows.map(({ hour, row }) => {
       const hits = Number(row.hits ?? 0);
       const misses = Number(row.misses ?? 0);
       const total = hits + misses;
@@ -175,20 +186,34 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
     });
   }
 
-  async getTableStats(): Promise<TableCacheStats[]> {
-    await this.flush();
-    const tables = await this.redis.smembers(this.tableIndexKey());
-    if (tables.length === 0) return [];
+  private toTableStats(
+    rows: Array<{ hour: string; row: Record<string, string> }>,
+  ): TableCacheStats[] {
+    const agg = new Map<string, { hits: number; misses: number }>();
 
-    const pipeline = this.redis.pipeline();
-    for (const table of tables) pipeline.hgetall(this.tableStatsKey(table));
-    const results = await pipeline.exec();
+    for (const { row } of rows) {
+      for (const [field, raw] of Object.entries(row)) {
+        const n = Number(raw ?? 0);
+        if (!Number.isFinite(n) || n === 0) continue;
 
-    return tables
-      .map((table, i) => {
-        const row = (results?.[i]?.[1] ?? {}) as Record<string, string>;
-        const hits = Number(row.hits ?? 0);
-        const misses = Number(row.misses ?? 0);
+        if (field.startsWith(TABLE_HIT_PREFIX)) {
+          const table = field.slice(TABLE_HIT_PREFIX.length);
+          if (!table) continue;
+          const cur = agg.get(table) ?? { hits: 0, misses: 0 };
+          cur.hits += n;
+          agg.set(table, cur);
+        } else if (field.startsWith(TABLE_MISS_PREFIX)) {
+          const table = field.slice(TABLE_MISS_PREFIX.length);
+          if (!table) continue;
+          const cur = agg.get(table) ?? { hits: 0, misses: 0 };
+          cur.misses += n;
+          agg.set(table, cur);
+        }
+      }
+    }
+
+    return [...agg.entries()]
+      .map(([table, { hits, misses }]) => {
         const total = hits + misses;
         return {
           table,
@@ -198,6 +223,25 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
         };
       })
       .sort((a, b) => b.hits + b.misses - (a.hits + a.misses));
+  }
+
+  async getWindowStats(hours = 24): Promise<WindowCacheStats> {
+    await this.flush();
+    const rows = await this.loadHourlyRows(hours);
+    return {
+      stats: this.toHourlyStats(rows),
+      tableStats: this.toTableStats(rows),
+    };
+  }
+
+  async getHourlyStats(hours = 24): Promise<HourlyCacheStats[]> {
+    const { stats } = await this.getWindowStats(hours);
+    return stats;
+  }
+
+  async getTableStats(hours = 24): Promise<TableCacheStats[]> {
+    const { tableStats } = await this.getWindowStats(hours);
+    return tableStats;
   }
 
   async destroy(): Promise<void> {

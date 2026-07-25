@@ -183,7 +183,7 @@ root.insertAdjacentHTML(
     <div id="view-tables" class="view">
       <section class="card">
         <label>Per-table hit / miss</label>
-        <div class="hint" style="margin:0 0 10px">From stats plugin (lifetime in retention window).</div>
+        <div class="hint" id="tableHitsHint" style="margin:0 0 10px">Same window as the chart (6h / 24h / 7d).</div>
         <div class="table-toolbar">
           <input id="tableHitsSearch" type="search" placeholder="Search tables…" autocomplete="off" />
           <span class="count" id="tableHitsCount">0 shown</span>
@@ -399,6 +399,11 @@ function renderTables(data) {
   const indexBody = document.getElementById('tableIndexBody');
   const tableStats = data.tableStats || [];
   const tableIndexes = data.tableIndexes || [];
+  const windowHours = data.hours || hours;
+  const hint = document.getElementById('tableHitsHint');
+  if (hint) {
+    hint.textContent = `Same window as the chart — last ${windowHours} local hour${windowHours === 1 ? '' : 's'}.`;
+  }
 
   hitsBody.innerHTML = tableStats.length
     ? tableStats

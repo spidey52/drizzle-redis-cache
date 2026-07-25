@@ -44,7 +44,7 @@ Default admin credentials (seeded into Redis once): `admin` / `admin`.
 - Hourly chart ranges: **6h / 24h / 7d**, CSV export, keyboard **R** refresh
 - Flush all or per-table (confirm modal)
 - Redis health, query key counts, approx memory sample
-- Per-table hit/miss + table index sizes
+- Per-table hit/miss for the **same hour window** as the chart (stored as fields on each hourly hash)
 - `readOnly: true` for view-only deployments
 - Toasts instead of alerts
 

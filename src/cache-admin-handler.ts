@@ -149,26 +149,24 @@ export function createCacheAdminHandler(
 
       if (method === 'GET' && path === '/api') {
         const hours = parseHours(url.searchParams.get('hours'));
-        const [enabled, ttlSeconds, stats, health, keyStats, tableIndexes, tableStats] =
-          await Promise.all([
-            cache.isCacheEnabled(),
-            cache.getDefaultTtlSeconds(),
-            cache.getHourlyStats(hours),
-            cache.getHealth(),
-            cache.getKeyStats(),
-            cache.getTableIndexStats(),
-            cache.getTableHitStats(),
-          ]);
+        const [enabled, ttlSeconds, window, health, keyStats, tableIndexes] = await Promise.all([
+          cache.isCacheEnabled(),
+          cache.getDefaultTtlSeconds(),
+          cache.getWindowStats(hours),
+          cache.getHealth(),
+          cache.getKeyStats(),
+          cache.getTableIndexStats(),
+        ]);
         return withCors(
           json({
             enabled,
             ttlSeconds,
             hours,
-            stats,
+            stats: window.stats,
             health,
             keyStats,
             tableIndexes,
-            tableStats,
+            tableStats: window.tableStats,
             readOnly,
           }),
           req,

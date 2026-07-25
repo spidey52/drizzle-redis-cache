@@ -3,13 +3,19 @@ import { getTableName, is, Table } from 'drizzle-orm';
 import { Cache, type MutationOption } from 'drizzle-orm/cache/core';
 import type { CacheConfig } from 'drizzle-orm/cache/core/types';
 import { Redis } from 'ioredis';
-import type { CacheStatsCollector, HourlyCacheStats, TableCacheStats } from './cache-stats-plugin';
+import type {
+  CacheStatsCollector,
+  HourlyCacheStats,
+  TableCacheStats,
+  WindowCacheStats,
+} from './cache-stats-plugin';
 
 export type {
   CacheStatsCollector,
   HourlyCacheStats,
   RedisHourlyStatsPluginOptions,
   TableCacheStats,
+  WindowCacheStats,
 } from './cache-stats-plugin';
 export { RedisHourlyStatsPlugin } from './cache-stats-plugin';
 
@@ -212,8 +218,18 @@ export class DrizzleRedisCache extends Cache {
     return this.stats ? this.stats.getHourlyStats(hours) : [];
   }
 
-  async getTableHitStats(): Promise<TableCacheStats[]> {
-    return this.stats?.getTableStats ? this.stats.getTableStats() : [];
+  async getTableHitStats(hours = 24): Promise<TableCacheStats[]> {
+    return this.stats?.getTableStats ? this.stats.getTableStats(hours) : [];
+  }
+
+  /** Single pipelined read of hourly + per-table stats for the window. */
+  async getWindowStats(hours = 24): Promise<WindowCacheStats> {
+    if (this.stats?.getWindowStats) return this.stats.getWindowStats(hours);
+    const [stats, tableStats] = await Promise.all([
+      this.getHourlyStats(hours),
+      this.getTableHitStats(hours),
+    ]);
+    return { stats, tableStats };
   }
 
   async flushStats(): Promise<void> {
