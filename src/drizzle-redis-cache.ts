@@ -3,9 +3,14 @@ import { getTableName, is, Table } from 'drizzle-orm';
 import { Cache, type MutationOption } from 'drizzle-orm/cache/core';
 import type { CacheConfig } from 'drizzle-orm/cache/core/types';
 import { Redis } from 'ioredis';
-import type { CacheStatsCollector, HourlyCacheStats } from './cache-stats-plugin';
+import type { CacheStatsCollector, HourlyCacheStats, TableCacheStats } from './cache-stats-plugin';
 
-export type { CacheStatsCollector, HourlyCacheStats, RedisHourlyStatsPluginOptions } from './cache-stats-plugin';
+export type {
+  CacheStatsCollector,
+  HourlyCacheStats,
+  RedisHourlyStatsPluginOptions,
+  TableCacheStats,
+} from './cache-stats-plugin';
 export { RedisHourlyStatsPlugin } from './cache-stats-plugin';
 
 export const CACHE_TTL_MIN_SECONDS = 1;
@@ -207,12 +212,214 @@ export class DrizzleRedisCache extends Cache {
     return this.stats ? this.stats.getHourlyStats(hours) : [];
   }
 
+  async getTableHitStats(): Promise<TableCacheStats[]> {
+    return this.stats?.getTableStats ? this.stats.getTableStats() : [];
+  }
+
   async flushStats(): Promise<void> {
     await this.stats?.flush();
   }
 
   async destroy(): Promise<void> {
     await this.stats?.destroy();
+  }
+
+  // --- Admin ops: health / keys / flush ---
+
+  getNamespace(): string {
+    return this.namespace;
+  }
+
+  async getHealth(): Promise<{
+    ok: boolean;
+    redis: 'pong' | 'error';
+    redisError?: string;
+    namespace: string;
+    strategy: 'all' | 'explicit';
+    enabled: boolean;
+    defaultTtlSeconds: number;
+    metaCheckedAt: number | null;
+    metaAgeMs: number | null;
+    statsPlugin: boolean;
+  }> {
+    let redis: 'pong' | 'error' = 'error';
+    let redisError: string | undefined;
+    try {
+      const pong = await this.redis.ping();
+      redis = pong === 'PONG' ? 'pong' : 'error';
+      if (redis === 'error') redisError = `Unexpected ping reply: ${pong}`;
+    } catch (err) {
+      redisError = err instanceof Error ? err.message : String(err);
+    }
+
+    await this.refreshMeta().catch(() => undefined);
+    const metaCheckedAt = this.metaCheckedAt || null;
+
+    return {
+      ok: redis === 'pong',
+      redis,
+      redisError,
+      namespace: this.namespace,
+      strategy: this.cacheStrategy,
+      enabled: this.enabled,
+      defaultTtlSeconds: this.defaultTtlSeconds,
+      metaCheckedAt,
+      metaAgeMs: metaCheckedAt == null ? null : Date.now() - metaCheckedAt,
+      statsPlugin: this.stats != null,
+    };
+  }
+
+  /**
+   * Measure Redis round-trip delay from this process (network + Redis).
+   * Runs PING and GET samples against a tiny probe key.
+   */
+  async measureLatency(samples = 20): Promise<{
+    samples: number;
+    ping: { minMs: number; avgMs: number; maxMs: number; p95Ms: number; valuesMs: number[] };
+    get: { minMs: number; avgMs: number; maxMs: number; p95Ms: number; valuesMs: number[] };
+    probeKey: string;
+  }> {
+    const n = Math.max(5, Math.min(Math.floor(samples) || 20, 100));
+    const probeKey = this.key('meta', 'latency_probe');
+    await this.redis.set(probeKey, '1', 'EX', 60);
+
+    const pingMs: number[] = [];
+    const getMs: number[] = [];
+
+    for (let i = 0; i < n; i++) {
+      const t0 = performance.now();
+      await this.redis.ping();
+      pingMs.push(performance.now() - t0);
+
+      const t1 = performance.now();
+      await this.redis.get(probeKey);
+      getMs.push(performance.now() - t1);
+    }
+
+    const summarize = (valuesMs: number[]) => {
+      const sorted = [...valuesMs].sort((a, b) => a - b);
+      const sum = sorted.reduce((a, b) => a + b, 0);
+      const p95Index = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
+      return {
+        minMs: Number(sorted[0].toFixed(3)),
+        avgMs: Number((sum / sorted.length).toFixed(3)),
+        maxMs: Number(sorted[sorted.length - 1].toFixed(3)),
+        p95Ms: Number(sorted[p95Index].toFixed(3)),
+        valuesMs: valuesMs.map((v) => Number(v.toFixed(3))),
+      };
+    };
+
+    return {
+      samples: n,
+      ping: summarize(pingMs),
+      get: summarize(getMs),
+      probeKey,
+    };
+  }
+
+  private async scanKeys(match: string, count = 250): Promise<string[]> {
+    const keys: string[] = [];
+    let cursor = '0';
+    do {
+      const [next, batch] = await this.redis.scan(cursor, 'MATCH', match, 'COUNT', count);
+      cursor = next;
+      keys.push(...batch);
+    } while (cursor !== '0');
+    return keys;
+  }
+
+  async getKeyStats(sampleSize = 40): Promise<{
+    namespace: string;
+    queryKeys: number;
+    tableIndexKeys: number;
+    sampledKeys: number;
+    approxBytes: number | null;
+    memorySupported: boolean;
+  }> {
+    const [queryKeysList, tableKeysList] = await Promise.all([
+      this.scanKeys(`${this.namespace}:query:*`),
+      this.scanKeys(`${this.namespace}:table:*`),
+    ]);
+
+    const sample = queryKeysList.slice(0, Math.max(0, sampleSize));
+    let approxBytes: number | null = null;
+    let memorySupported = false;
+
+    if (sample.length > 0) {
+      try {
+        let total = 0;
+        let measured = 0;
+        for (const key of sample) {
+          const usage = await this.redis.call('MEMORY', 'USAGE', key);
+          if (typeof usage === 'number') {
+            total += usage;
+            measured += 1;
+            memorySupported = true;
+          }
+        }
+        if (measured > 0) {
+          approxBytes = Math.round((total / measured) * queryKeysList.length);
+        }
+      } catch {
+        memorySupported = false;
+        approxBytes = null;
+      }
+    }
+
+    return {
+      namespace: this.namespace,
+      queryKeys: queryKeysList.length,
+      tableIndexKeys: tableKeysList.length,
+      sampledKeys: sample.length,
+      approxBytes,
+      memorySupported,
+    };
+  }
+
+  async getTableIndexStats(): Promise<{ table: string; queryKeys: number }[]> {
+    const tableKeys = await this.scanKeys(`${this.namespace}:table:*`);
+    const prefix = `${this.namespace}:table:`;
+    const pipeline = this.redis.pipeline();
+    const tables: string[] = [];
+    for (const key of tableKeys) {
+      const table = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+      tables.push(table);
+      pipeline.scard(key);
+    }
+    const results = await pipeline.exec();
+    return tables
+      .map((table, i) => ({
+        table,
+        queryKeys: Number(results?.[i]?.[1] ?? 0),
+      }))
+      .sort((a, b) => b.queryKeys - a.queryKeys);
+  }
+
+  /** Delete cached queries (and table indexes). Does not clear stats or admin meta. */
+  async flushCache(tables?: string[]): Promise<{ deletedQueries: number; deletedTableIndexes: number }> {
+    if (tables?.length) {
+      let deletedQueries = 0;
+      const unique = [...new Set(tables.map(String).filter(Boolean))];
+      for (const table of unique) {
+        const members = await this.redis.smembers(this.key('table', table));
+        const pipeline = this.redis.pipeline();
+        for (const key of members) pipeline.del(this.key('query', key));
+        pipeline.del(this.key('table', table));
+        await pipeline.exec();
+        deletedQueries += members.length;
+      }
+      return { deletedQueries, deletedTableIndexes: unique.length };
+    }
+
+    const [queryKeys, tableKeys] = await Promise.all([
+      this.scanKeys(`${this.namespace}:query:*`),
+      this.scanKeys(`${this.namespace}:table:*`),
+    ]);
+    const pipeline = this.redis.pipeline();
+    for (const key of queryKeys) pipeline.del(key);
+    for (const key of tableKeys) pipeline.del(key);
+    if (queryKeys.length || tableKeys.length) await pipeline.exec();
+    return { deletedQueries: queryKeys.length, deletedTableIndexes: tableKeys.length };
   }
 
   // --- Drizzle Cache API ---
@@ -226,23 +433,23 @@ export class DrizzleRedisCache extends Cache {
 
   override async get(
     key: string,
-    _tables: string[],
+    tables: string[],
     _isTag: boolean,
     _isAutoInvalidate?: boolean,
   ): Promise<any[] | undefined> {
     await this.refreshMetaIfStale();
     if (!this.enabled) {
-      this.stats?.recordMiss();
+      this.stats?.recordMiss(tables);
       return undefined;
     }
 
     const raw = await this.redis.get(this.key('query', key));
     if (raw == null) {
-      this.stats?.recordMiss();
+      this.stats?.recordMiss(tables);
       return undefined;
     }
 
-    this.stats?.recordHit();
+    this.stats?.recordHit(tables);
     return JSON.parse(raw) as any[];
   }
 

@@ -1,17 +1,44 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { CACHE_ADMIN_HTML } from './cache-admin-html';
+import {
+  DEFAULT_CACHE_ADMIN_UI_BASE_URL,
+  renderCacheAdminHtml,
+} from './cache-admin-html';
 import type { DrizzleRedisCache } from './drizzle-redis-cache';
 
 export type CacheAdminFetchHandler = (req: Request) => Promise<Response>;
-export type CacheAdminHandlerOptions = { basePath?: string };
 
-
+export type CacheAdminHandlerOptions = {
+  basePath?: string;
+  /** Hosted `ui/` folder URL (no trailing slash). Defaults to jsDelivr `@main/ui`. */
+  uiBaseUrl?: string;
+  /** @deprecated Use `uiBaseUrl`. */
+  uiScriptUrl?: string;
+  /**
+   * Enable CORS so a separately hosted UI (`ui/index.html?api=...`) can call the API.
+   * Reflects `Origin` when present.
+   */
+  cors?: boolean;
+  /** When true, mutation endpoints (enable/TTL/credentials/flush) return 403. */
+  readOnly?: boolean;
+};
 
 function json(data: unknown, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8', ...headers },
   });
+}
+
+function corsHeaders(req: Request, enabled: boolean): HeadersInit {
+  if (!enabled) return {};
+  const origin = req.headers.get('origin') || '*';
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    Vary: 'Origin',
+  };
 }
 
 function stripBasePath(pathname: string, basePath?: string): string {
@@ -60,66 +87,162 @@ async function readBody<T>(req: Request): Promise<T | null> {
   }
 }
 
+function withCors(response: Response, req: Request, enabled: boolean): Response {
+  if (!enabled) return response;
+  const headers = new Headers(response.headers);
+  for (const [k, v] of Object.entries(corsHeaders(req, true))) {
+    headers.set(k, v);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function parseHours(raw: string | null): number {
+  const n = Number(raw ?? 24);
+  if (!Number.isFinite(n)) return 24;
+  return Math.max(1, Math.min(Math.floor(n), 24 * 31));
+}
+
 /** Fetch handler for Bun / Hono (`c.req.raw`) / any Fetch runtime. */
 export function createCacheAdminHandler(
   cache: DrizzleRedisCache,
   options: CacheAdminHandlerOptions = {},
 ): CacheAdminFetchHandler {
+  const cors = options.cors === true;
+  const readOnly = options.readOnly === true;
+
   return async (req) => {
-    const path = stripBasePath(new URL(req.url).pathname, options.basePath);
+    const url = new URL(req.url);
+    const path = stripBasePath(url.pathname, options.basePath);
     const method = req.method.toUpperCase();
 
     try {
+      if (method === 'OPTIONS' && cors) {
+        return new Response(null, { status: 204, headers: corsHeaders(req, true) });
+      }
+
       if (method === 'GET' && (path === '/' || path === '/index.html')) {
         await cache.ensureAdminCredentials();
-        return new Response(CACHE_ADMIN_HTML, {
+        const apiBase =
+          (options.basePath ? options.basePath.replace(/\/$/, '') : '') ||
+          url.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '');
+        const html = renderCacheAdminHtml({
+          apiBase,
+          uiBaseUrl: options.uiBaseUrl ?? DEFAULT_CACHE_ADMIN_UI_BASE_URL,
+          uiScriptUrl: options.uiScriptUrl,
+          readOnly,
+        });
+        return new Response(html, {
           headers: { 'content-type': 'text/html; charset=utf-8' },
         });
       }
 
-      if (!path.startsWith('/api')) return json({ error: 'Not found' }, 404);
+      if (!path.startsWith('/api')) {
+        return withCors(json({ error: 'Not found' }, 404), req, cors);
+      }
 
       const authError = await requireAdmin(cache, req);
-      if (authError) return authError;
+      if (authError) return withCors(authError, req, cors);
 
       if (method === 'GET' && path === '/api') {
-        const [enabled, ttlSeconds, stats] = await Promise.all([
-          cache.isCacheEnabled(),
-          cache.getDefaultTtlSeconds(),
-          cache.getHourlyStats(24),
-        ]);
-        return json({ enabled, ttlSeconds, stats });
+        const hours = parseHours(url.searchParams.get('hours'));
+        const [enabled, ttlSeconds, stats, health, keyStats, tableIndexes, tableStats] =
+          await Promise.all([
+            cache.isCacheEnabled(),
+            cache.getDefaultTtlSeconds(),
+            cache.getHourlyStats(hours),
+            cache.getHealth(),
+            cache.getKeyStats(),
+            cache.getTableIndexStats(),
+            cache.getTableHitStats(),
+          ]);
+        return withCors(
+          json({
+            enabled,
+            ttlSeconds,
+            hours,
+            stats,
+            health,
+            keyStats,
+            tableIndexes,
+            tableStats,
+            readOnly,
+          }),
+          req,
+          cors,
+        );
+      }
+
+      if (method === 'GET' && path === '/api/health') {
+        return withCors(json({ ...(await cache.getHealth()), readOnly }), req, cors);
+      }
+
+      if (method === 'POST' && path === '/api/latency-test') {
+        const body = await readBody<{ samples?: number }>(req);
+        const samples =
+          typeof body?.samples === 'number' && Number.isFinite(body.samples)
+            ? body.samples
+            : 20;
+        return withCors(json(await cache.measureLatency(samples)), req, cors);
       }
 
       if (method === 'POST' && path === '/api/enabled') {
+        if (readOnly) return withCors(json({ error: 'Admin is read-only' }, 403), req, cors);
         const body = await readBody<{ enabled?: boolean }>(req);
         if (typeof body?.enabled !== 'boolean') {
-          return json({ error: 'Body must include boolean `enabled`' }, 400);
+          return withCors(json({ error: 'Body must include boolean `enabled`' }, 400), req, cors);
         }
         await cache.setEnabled(body.enabled);
-        return json({ enabled: body.enabled });
+        return withCors(json({ enabled: body.enabled }), req, cors);
       }
 
       if (method === 'POST' && path === '/api/ttl') {
+        if (readOnly) return withCors(json({ error: 'Admin is read-only' }, 403), req, cors);
         const body = await readBody<{ seconds?: number }>(req);
         if (typeof body?.seconds !== 'number' || !Number.isFinite(body.seconds)) {
-          return json({ error: 'Body must include numeric `seconds`' }, 400);
+          return withCors(json({ error: 'Body must include numeric `seconds`' }, 400), req, cors);
         }
-        return json({ ttlSeconds: await cache.setDefaultTtlSeconds(body.seconds) });
+        return withCors(
+          json({ ttlSeconds: await cache.setDefaultTtlSeconds(body.seconds) }),
+          req,
+          cors,
+        );
       }
 
       if (method === 'POST' && path === '/api/credentials') {
+        if (readOnly) return withCors(json({ error: 'Admin is read-only' }, 403), req, cors);
         const body = await readBody<{ username?: string; password?: string }>(req);
         if (!body?.username || !body?.password) {
-          return json({ error: 'Body must include username and password' }, 400);
+          return withCors(
+            json({ error: 'Body must include username and password' }, 400),
+            req,
+            cors,
+          );
         }
         await cache.setAdminCredentials(body.username, body.password);
-        return json({ ok: true });
+        return withCors(json({ ok: true }), req, cors);
       }
 
-      return json({ error: 'Not found' }, 404);
+      if (method === 'POST' && path === '/api/flush') {
+        if (readOnly) return withCors(json({ error: 'Admin is read-only' }, 403), req, cors);
+        const body = await readBody<{ tables?: string[] }>(req);
+        const tables = Array.isArray(body?.tables)
+          ? body.tables.filter((t): t is string => typeof t === 'string' && t.length > 0)
+          : undefined;
+        const result = await cache.flushCache(tables?.length ? tables : undefined);
+        return withCors(json({ ok: true, ...result }), req, cors);
+      }
+
+      return withCors(json({ error: 'Not found' }, 404), req, cors);
     } catch (err) {
-      return json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+      return withCors(
+        json({ error: err instanceof Error ? err.message : 'Internal error' }, 500),
+        req,
+        cors,
+      );
     }
   };
 }

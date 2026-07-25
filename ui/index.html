@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Drizzle Cache Admin</title>
+  <link rel="stylesheet" href="./app.css" />
+  <style>
+    .boot-loader{position:fixed;inset:0;display:grid;place-items:center;background:#0b1017;color:#8b9bb4;font-family:system-ui,sans-serif}
+    .boot-loader.hidden{display:none}
+    .boot-spinner{width:36px;height:36px;border-radius:50%;border:3px solid rgba(232,238,247,.15);border-top-color:#4d9fff;animation:boot-spin .7s linear infinite;margin:0 auto 12px}
+    @keyframes boot-spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+  <div id="drizzle-cache-admin-root">
+    <div class="boot-loader" id="bootLoader">
+      <div>
+        <div class="boot-spinner" aria-hidden="true"></div>
+        <div style="text-align:center">Loading cache admin…</div>
+      </div>
+    </div>
+  </div>
+  <noscript>JavaScript is required. Pass your API as <code>?api=https://your-host/admin/cache</code>.</noscript>
+  <script>
+    // Standalone: open with ?api=https://orders.example.com/admin/cache
+    window.__DRIZZLE_CACHE_ADMIN__ = {
+      apiBase: new URLSearchParams(location.search).get('api') || '',
+      defaults: {
+        username: 'admin',
+        password: 'admin',
+        ttlMinSeconds: 1,
+        ttlMaxSeconds: 3600,
+        ttlDefaultSeconds: 300,
+      },
+    };
+  </script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

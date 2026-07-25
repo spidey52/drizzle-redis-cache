@@ -8,11 +8,19 @@ export type HourlyCacheStats = {
   hitRate: number;
 };
 
+export type TableCacheStats = {
+  table: string;
+  hits: number;
+  misses: number;
+  hitRate: number;
+};
+
 export interface CacheStatsCollector {
-  recordHit(): void;
-  recordMiss(): void;
+  recordHit(tables?: string[]): void;
+  recordMiss(tables?: string[]): void;
   flush(): Promise<void>;
   getHourlyStats(hours?: number): Promise<HourlyCacheStats[]>;
+  getTableStats?(): Promise<TableCacheStats[]>;
   destroy(): Promise<void>;
 }
 
@@ -31,6 +39,8 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
   private readonly retentionSeconds: number;
   private hits = 0;
   private misses = 0;
+  private readonly tableHits = new Map<string, number>();
+  private readonly tableMisses = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(redis: Redis, options: RedisHourlyStatsPluginOptions = {}) {
@@ -43,6 +53,14 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
 
   private statsKey(hour: string): string {
     return `${this.namespace}:stats:${hour}`;
+  }
+
+  private tableStatsKey(table: string): string {
+    return `${this.namespace}:table_stats:${table}`;
+  }
+
+  private tableIndexKey(): string {
+    return `${this.namespace}:meta:table_stats_index`;
   }
 
   private hourBucket(date = new Date()): string {
@@ -77,21 +95,35 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
     return buckets;
   }
 
-  recordHit(): void {
-    this.hits += 1;
+  private bumpTable(map: Map<string, number>, tables?: string[]) {
+    if (!tables?.length) return;
+    for (const table of tables) {
+      if (!table) continue;
+      map.set(table, (map.get(table) ?? 0) + 1);
+    }
   }
 
-  recordMiss(): void {
+  recordHit(tables?: string[]): void {
+    this.hits += 1;
+    this.bumpTable(this.tableHits, tables);
+  }
+
+  recordMiss(tables?: string[]): void {
     this.misses += 1;
+    this.bumpTable(this.tableMisses, tables);
   }
 
   async flush(): Promise<void> {
     const hits = this.hits;
     const misses = this.misses;
-    if (hits === 0 && misses === 0) return;
+    const tableHits = new Map(this.tableHits);
+    const tableMisses = new Map(this.tableMisses);
+    if (hits === 0 && misses === 0 && tableHits.size === 0 && tableMisses.size === 0) return;
 
     this.hits = 0;
     this.misses = 0;
+    this.tableHits.clear();
+    this.tableMisses.clear();
 
     const key = this.statsKey(this.hourBucket());
     try {
@@ -99,10 +131,25 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
       if (hits > 0) pipeline.hincrby(key, 'hits', hits);
       if (misses > 0) pipeline.hincrby(key, 'misses', misses);
       pipeline.expire(key, this.retentionSeconds);
+
+      const tables = new Set([...tableHits.keys(), ...tableMisses.keys()]);
+      for (const table of tables) {
+        const tKey = this.tableStatsKey(table);
+        const th = tableHits.get(table) ?? 0;
+        const tm = tableMisses.get(table) ?? 0;
+        if (th > 0) pipeline.hincrby(tKey, 'hits', th);
+        if (tm > 0) pipeline.hincrby(tKey, 'misses', tm);
+        pipeline.expire(tKey, this.retentionSeconds);
+        pipeline.sadd(this.tableIndexKey(), table);
+      }
+      if (tables.size > 0) pipeline.expire(this.tableIndexKey(), this.retentionSeconds);
+
       await pipeline.exec();
     } catch {
       this.hits += hits;
       this.misses += misses;
+      for (const [t, n] of tableHits) this.tableHits.set(t, (this.tableHits.get(t) ?? 0) + n);
+      for (const [t, n] of tableMisses) this.tableMisses.set(t, (this.tableMisses.get(t) ?? 0) + n);
     }
   }
 
@@ -126,6 +173,31 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
         hitRate: total === 0 ? 0 : hits / total,
       };
     });
+  }
+
+  async getTableStats(): Promise<TableCacheStats[]> {
+    await this.flush();
+    const tables = await this.redis.smembers(this.tableIndexKey());
+    if (tables.length === 0) return [];
+
+    const pipeline = this.redis.pipeline();
+    for (const table of tables) pipeline.hgetall(this.tableStatsKey(table));
+    const results = await pipeline.exec();
+
+    return tables
+      .map((table, i) => {
+        const row = (results?.[i]?.[1] ?? {}) as Record<string, string>;
+        const hits = Number(row.hits ?? 0);
+        const misses = Number(row.misses ?? 0);
+        const total = hits + misses;
+        return {
+          table,
+          hits,
+          misses,
+          hitRate: total === 0 ? 0 : hits / total,
+        };
+      })
+      .sort((a, b) => b.hits + b.misses - (a.hits + a.misses));
   }
 
   async destroy(): Promise<void> {

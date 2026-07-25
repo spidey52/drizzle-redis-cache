@@ -2,6 +2,9 @@
  * Redis-backed Drizzle query cache + optional hourly stats + admin HTTP handlers.
  *
  * Peer dependencies: **drizzle-orm**, **ioredis**
+ *
+ * Admin UI is loaded from a remote script (default jsDelivr). Update `ui/app.js`
+ * on GitHub to ship UI changes without bumping this package.
  */
 export {
   CACHE_ADMIN_DEFAULT_PASSWORD,
@@ -17,6 +20,7 @@ export {
   type DrizzleRedisCacheOptions,
   type HourlyCacheStats,
   type RedisHourlyStatsPluginOptions,
+  type TableCacheStats,
 } from './drizzle-redis-cache';
 
 export {
@@ -26,4 +30,10 @@ export {
   type CacheAdminHandlerOptions,
 } from './cache-admin-handler';
 
-export { CACHE_ADMIN_HTML } from './cache-admin-html';
+export {
+  CACHE_ADMIN_HTML,
+  DEFAULT_CACHE_ADMIN_UI_BASE_URL,
+  DEFAULT_CACHE_ADMIN_UI_SCRIPT_URL,
+  renderCacheAdminHtml,
+  type CacheAdminHtmlOptions,
+} from './cache-admin-html';

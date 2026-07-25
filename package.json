@@ -1,7 +1,7 @@
 {
   "name": "@spidey52/drizzle-redis-cache",
-  "version": "1.0.0",
-  "description": "Redis-backed Drizzle ORM query cache with hourly stats and admin HTTP UI",
+  "version": "1.2.1",
+  "description": "Redis-backed Drizzle ORM query cache with hourly stats, flush/health APIs, and hosted admin UI",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
