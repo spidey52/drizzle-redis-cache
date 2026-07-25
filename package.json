@@ -1,0 +1,46 @@
+{
+  "name": "@spidey52/drizzle-redis-cache",
+  "version": "1.0.0",
+  "description": "Redis-backed Drizzle ORM query cache with hourly stats and admin HTTP UI",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=0.40.0",
+    "ioredis": ">=5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "drizzle-orm": "^0.45.1",
+    "ioredis": "^5.11.1",
+    "typescript": "~5.7.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "drizzle",
+    "redis",
+    "cache",
+    "ioredis",
+    "orm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spidey52/drizzle-redis-cache.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
