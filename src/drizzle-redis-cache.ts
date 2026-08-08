@@ -1,8 +1,8 @@
-import { timingSafeEqual } from 'node:crypto';
 import { getTableName, is, Table } from 'drizzle-orm';
 import { Cache, type MutationOption } from 'drizzle-orm/cache/core';
 import type { CacheConfig } from 'drizzle-orm/cache/core/types';
 import { Redis } from 'ioredis';
+import { timingSafeEqual } from 'node:crypto';
 import type {
   CacheStatsCollector,
   HourlyCacheStats,
@@ -10,14 +10,14 @@ import type {
   WindowCacheStats,
 } from './cache-stats-plugin';
 
+export { RedisHourlyStatsPlugin } from './cache-stats-plugin';
 export type {
   CacheStatsCollector,
   HourlyCacheStats,
   RedisHourlyStatsPluginOptions,
   TableCacheStats,
-  WindowCacheStats,
+  WindowCacheStats
 } from './cache-stats-plugin';
-export { RedisHourlyStatsPlugin } from './cache-stats-plugin';
 
 export const CACHE_TTL_MIN_SECONDS = 1;
 export const CACHE_TTL_MAX_SECONDS = 60 * 60;
@@ -456,6 +456,11 @@ export class DrizzleRedisCache extends Cache {
     await this.refreshMetaIfStale();
     if (!this.enabled) {
       this.stats?.recordMiss(tables);
+      return undefined;
+    }
+
+    // If no tables are provided, return undefined, using this for view queries
+    if (tables.length === 0) {
       return undefined;
     }
 
