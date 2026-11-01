@@ -6,6 +6,8 @@ type Reply = unknown;
 
 export class FakeRedis {
   fail = false;
+  /** writes fail inside pipelines the way Redis OOM / MISCONF behaves: reads keep working */
+  failWrites = false;
   readonly log: string[][] = [];
   private readonly strings = new Map<string, string>();
   private readonly sets = new Map<string, Set<string>>();
@@ -57,6 +59,7 @@ export class FakeRedis {
 
   async set(key: string, value: string, ...args: (string | number)[]): Promise<'OK'> {
     this.check(['set', key, value, ...args.map(String)]);
+    if (this.failWrites) throw new Error("OOM command not allowed when used memory > 'maxmemory'");
     this.strings.set(key, value);
     this.expiry.delete(key);
     const mode = String(args[0] ?? '').toUpperCase();

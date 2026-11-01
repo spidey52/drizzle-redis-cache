@@ -8,7 +8,7 @@ import {
  * Git tag of the `ui/` folder this package version is built for. Bump it with the package version
  * and tag the release, so a later push to `main` cannot change what a deployed admin page runs.
  */
-export const CACHE_ADMIN_UI_VERSION_TAG = 'v2.0.0';
+export const CACHE_ADMIN_UI_VERSION_TAG = 'v2.0.1';
 
 /** Hosted UI folder (CSS + ES modules), pinned to this version's tag. */
 export const DEFAULT_CACHE_ADMIN_UI_BASE_URL = `https://cdn.jsdelivr.net/gh/spidey52/drizzle-redis-cache@${CACHE_ADMIN_UI_VERSION_TAG}/ui`;

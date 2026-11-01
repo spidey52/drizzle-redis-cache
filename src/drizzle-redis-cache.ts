@@ -84,7 +84,10 @@ export type DrizzleRedisCacheOptions = {
    * still bump their version, so other instances on the namespace are still invalidated.
    */
   skipTables?: ReadonlyArray<string | Table>;
-  /** TTL in seconds per table (`schema.table`). A query takes the smallest TTL among its tables. */
+  /**
+   * TTL in seconds per table (`schema.table`). A query takes the smallest configured TTL among its
+   * tables, or the default when none of them is configured.
+   */
   ttlByTable?: Record<string, number>;
   /**
    * Await the Redis write on a miss (default false). By default the write runs in the background
@@ -154,7 +157,11 @@ type Envelope = {
   v: typeof ENVELOPE_VERSION;
   /** table → version counter at the time the rows were read */
   t: Versions;
-  r: unknown[];
+  /**
+   * whatever Drizzle handed `put`: a rows array for relational queries, the driver's whole result
+   * object (`{ command, rowCount, rows, fields, ... }`) for node-postgres selects. Returned as-is.
+   */
+  r: unknown;
 };
 
 type Pending = { at: number; versions: Versions | null; skip: boolean };
@@ -611,15 +618,19 @@ export class DrizzleRedisCache extends Cache {
 
   // --- Drizzle Cache API ---
 
+  /**
+   * The query's own config wins; else the smallest `ttlByTable` entry among its tables, so a join
+   * is never kept longer than its most volatile configured table; else the default.
+   */
   private ttlFor(tables: string[], config?: CacheConfig): number {
     if (config?.px != null) return Math.max(1, Math.ceil(config.px / 1000));
     if (config?.ex != null) return config.ex;
-    let ttl = this.defaultTtlSeconds;
+    let ttl: number | null = null;
     for (const table of tables) {
       const t = this.ttlByTable.get(table);
-      if (t != null && t < ttl) ttl = t;
+      if (t != null && (ttl === null || t < ttl)) ttl = t;
     }
-    return ttl;
+    return ttl ?? this.defaultTtlSeconds;
   }
 
   private touchesSkippedTable(tables: string[]): boolean {
@@ -695,8 +706,9 @@ export class DrizzleRedisCache extends Cache {
       const envelope = JSON.parse(raw) as Partial<Envelope> | null;
       const fresh =
         envelope != null &&
+        typeof envelope === 'object' &&
         envelope.v === ENVELOPE_VERSION &&
-        Array.isArray(envelope.r) &&
+        'r' in envelope &&
         (tables.length === 0 ||
           DrizzleRedisCache.sameVersions(tables, envelope.t ?? {}, versions));
       if (!fresh) {
@@ -761,7 +773,9 @@ export class DrizzleRedisCache extends Cache {
           pipeline.expire(this.key('table', table), CACHE_TTL_MAX_SECONDS);
         }
       }
-      await pipeline.exec();
+      // a pipeline resolves even when a command failed (OOM, MISCONF, wrong type): surface the first
+      const failed = (await pipeline.exec())?.find(([err]) => err);
+      if (failed) throw failed[0];
     };
 
     const run = write().catch((err) => {

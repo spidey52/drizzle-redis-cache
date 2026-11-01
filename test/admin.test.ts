@@ -46,7 +46,7 @@ describe('admin handler', () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).not.toContain('"admin"');
-    expect(html).toContain('@v2.0.0/ui/app.js');
+    expect(html).toContain('@v2.0.1/ui/app.js');
   });
 
   it('CORS: a list allows only those origins; true reflects any', async () => {

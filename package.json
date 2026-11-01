@@ -1,6 +1,6 @@
 {
   "name": "@spidey52/drizzle-redis-cache",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Redis-backed Drizzle ORM query cache: table-version invalidation, fail-open, per-table skip list and TTL, hourly stats, admin API and UI",
   "type": "module",
   "main": "./dist/index.js",

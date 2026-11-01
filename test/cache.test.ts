@@ -45,6 +45,14 @@ describe('get / put', () => {
     expect(await cache.get('k1', T, false, true)).toEqual(rows);
   });
 
+  it('returns whatever shape Drizzle stored: the node-postgres result object, not only arrays', async () => {
+    const { cache } = make();
+    const pgResult = { command: 'SELECT', rowCount: 1, rows, fields: [{ name: 'id' }], oid: null };
+    await cache.get('k1', T, false, true);
+    await cache.put('k1', pgResult, T, false);
+    expect(await cache.get('k1', T, false, true)).toEqual(pgResult);
+  });
+
   it('a tagged query with no tables (autoInvalidate off) is cached and hits', async () => {
     const { cache } = make();
     expect(await cache.get('order:42', [], true, false)).toBeUndefined();
@@ -125,6 +133,17 @@ describe('TTL', () => {
     expect(redis.ttlOf('drizzle:query:k1')).toBe(20);
   });
 
+  it('a configured per-table TTL applies even when it is longer than the default', async () => {
+    const { cache, redis } = make({ ttlByTable: { 'master.categories': 3600 } });
+    await cache.get('k1', ['master.categories'], false, true);
+    await cache.put('k1', rows, ['master.categories'], false);
+    expect(redis.ttlOf('drizzle:query:k1')).toBe(3600);
+    // a join with an unconfigured table still takes the configured one, not the default
+    await cache.get('k2', ['master.categories', 'master.products'], false, true);
+    await cache.put('k2', rows, ['master.categories', 'master.products'], false);
+    expect(redis.ttlOf('drizzle:query:k2')).toBe(3600);
+  });
+
   it('honours the query config over defaults', async () => {
     const { cache, redis } = make();
     await cache.get('k1', T, false, true);
@@ -142,6 +161,16 @@ describe('fail open', () => {
     await expect(cache.onMutate({ tables: T })).resolves.toBeUndefined();
     // the background meta refresh fails too and is reported, never thrown
     expect(errors.filter((op) => op !== 'meta')).toEqual(['get', 'put', 'onMutate']);
+  });
+
+  it('a write that fails inside the pipeline (OOM, MISCONF) is reported, not swallowed', async () => {
+    const { cache, redis, errors } = make();
+    redis.failWrites = true;
+    await cache.get('k1', T, false, true);
+    await expect(cache.put('k1', rows, T, false)).resolves.toBeUndefined();
+    expect(errors).toContain('put');
+    redis.failWrites = false;
+    expect(await cache.get('k1', T, false, true)).toBeUndefined();
   });
 
   it('put does not throw in background mode either', async () => {
