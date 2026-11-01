@@ -5,6 +5,10 @@ export type HourlyCacheStats = {
   hourStart: string;
   hits: number;
   misses: number;
+  /** queries the cache stepped aside for: disabled, or a skipped table */
+  skipped: number;
+  /** queries served from the database because Redis failed */
+  bypassed: number;
   hitRate: number;
 };
 
@@ -18,11 +22,20 @@ export type TableCacheStats = {
 export type WindowCacheStats = {
   stats: HourlyCacheStats[];
   tableStats: TableCacheStats[];
+  /** per table, `[hits, misses]` for each hour of `stats`, in the same order (optional) */
+  tableHourly?: Record<string, [number, number][]>;
 };
+
+/** Why a query was not looked up in the cache. */
+export type CacheSkipReason = 'disabled' | 'skip_table';
 
 export interface CacheStatsCollector {
   recordHit(tables?: string[]): void;
   recordMiss(tables?: string[]): void;
+  /** The cache did not take part in this query (optional). */
+  recordSkipped?(tables?: string[], reason?: CacheSkipReason): void;
+  /** Redis failed and the query ran against the database (optional). */
+  recordBypassed?(tables?: string[]): void;
   flush(): Promise<void>;
   getHourlyStats(hours?: number): Promise<HourlyCacheStats[]>;
   getTableStats?(hours?: number): Promise<TableCacheStats[]>;
@@ -48,6 +61,8 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
   private readonly retentionSeconds: number;
   private hits = 0;
   private misses = 0;
+  private skipped = 0;
+  private bypassed = 0;
   private readonly tableHits = new Map<string, number>();
   private readonly tableMisses = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -118,15 +133,36 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
     this.bumpTable(this.tableMisses, tables);
   }
 
+  recordSkipped(): void {
+    this.skipped += 1;
+  }
+
+  recordBypassed(): void {
+    this.bypassed += 1;
+  }
+
   async flush(): Promise<void> {
     const hits = this.hits;
     const misses = this.misses;
+    const skipped = this.skipped;
+    const bypassed = this.bypassed;
     const tableHits = new Map(this.tableHits);
     const tableMisses = new Map(this.tableMisses);
-    if (hits === 0 && misses === 0 && tableHits.size === 0 && tableMisses.size === 0) return;
+    if (
+      hits === 0 &&
+      misses === 0 &&
+      skipped === 0 &&
+      bypassed === 0 &&
+      tableHits.size === 0 &&
+      tableMisses.size === 0
+    ) {
+      return;
+    }
 
     this.hits = 0;
     this.misses = 0;
+    this.skipped = 0;
+    this.bypassed = 0;
     this.tableHits.clear();
     this.tableMisses.clear();
 
@@ -135,6 +171,8 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
       const pipeline = this.redis.pipeline();
       if (hits > 0) pipeline.hincrby(key, 'hits', hits);
       if (misses > 0) pipeline.hincrby(key, 'misses', misses);
+      if (skipped > 0) pipeline.hincrby(key, 'skipped', skipped);
+      if (bypassed > 0) pipeline.hincrby(key, 'bypassed', bypassed);
 
       const tables = new Set([...tableHits.keys(), ...tableMisses.keys()]);
       for (const table of tables) {
@@ -149,6 +187,8 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
     } catch {
       this.hits += hits;
       this.misses += misses;
+      this.skipped += skipped;
+      this.bypassed += bypassed;
       for (const [t, n] of tableHits) this.tableHits.set(t, (this.tableHits.get(t) ?? 0) + n);
       for (const [t, n] of tableMisses) this.tableMisses.set(t, (this.tableMisses.get(t) ?? 0) + n);
     }
@@ -181,6 +221,8 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
         hourStart: this.hourStartLocal(hour),
         hits,
         misses,
+        skipped: Number(row.skipped ?? 0),
+        bypassed: Number(row.bypassed ?? 0),
         hitRate: total === 0 ? 0 : hits / total,
       };
     });
@@ -225,12 +267,34 @@ export class RedisHourlyStatsPlugin implements CacheStatsCollector {
       .sort((a, b) => b.hits + b.misses - (a.hits + a.misses));
   }
 
+  private toTableHourly(
+    rows: Array<{ hour: string; row: Record<string, string> }>,
+  ): Record<string, [number, number][]> {
+    const out: Record<string, [number, number][]> = {};
+    const blank = () => rows.map((): [number, number] => [0, 0]);
+    rows.forEach(({ row }, i) => {
+      for (const [field, raw] of Object.entries(row)) {
+        const n = Number(raw ?? 0);
+        if (!Number.isFinite(n) || n === 0) continue;
+        if (field.startsWith(TABLE_HIT_PREFIX)) {
+          const table = field.slice(TABLE_HIT_PREFIX.length);
+          (out[table] ??= blank())[i]![0] += n;
+        } else if (field.startsWith(TABLE_MISS_PREFIX)) {
+          const table = field.slice(TABLE_MISS_PREFIX.length);
+          (out[table] ??= blank())[i]![1] += n;
+        }
+      }
+    });
+    return out;
+  }
+
   async getWindowStats(hours = 24): Promise<WindowCacheStats> {
     await this.flush();
     const rows = await this.loadHourlyRows(hours);
     return {
       stats: this.toHourlyStats(rows),
       tableStats: this.toTableStats(rows),
+      tableHourly: this.toTableHourly(rows),
     };
   }
 

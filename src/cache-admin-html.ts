@@ -1,14 +1,17 @@
 import {
-  CACHE_ADMIN_DEFAULT_PASSWORD,
-  CACHE_ADMIN_DEFAULT_USERNAME,
   CACHE_TTL_DEFAULT_SECONDS,
   CACHE_TTL_MAX_SECONDS,
   CACHE_TTL_MIN_SECONDS,
 } from './drizzle-redis-cache';
 
-/** Hosted UI folder (CSS + ES modules). Push `ui/` to GitHub to update without npm bump. */
-export const DEFAULT_CACHE_ADMIN_UI_BASE_URL =
-  'https://cdn.jsdelivr.net/gh/spidey52/drizzle-redis-cache@main/ui';
+/**
+ * Git tag of the `ui/` folder this package version is built for. Bump it with the package version
+ * and tag the release, so a later push to `main` cannot change what a deployed admin page runs.
+ */
+export const CACHE_ADMIN_UI_VERSION_TAG = 'v2.0.0';
+
+/** Hosted UI folder (CSS + ES modules), pinned to this version's tag. */
+export const DEFAULT_CACHE_ADMIN_UI_BASE_URL = `https://cdn.jsdelivr.net/gh/spidey52/drizzle-redis-cache@${CACHE_ADMIN_UI_VERSION_TAG}/ui`;
 
 /** @deprecated Prefer {@link DEFAULT_CACHE_ADMIN_UI_BASE_URL}. */
 export const DEFAULT_CACHE_ADMIN_UI_SCRIPT_URL = `${DEFAULT_CACHE_ADMIN_UI_BASE_URL}/app.js`;
@@ -44,7 +47,7 @@ function resolveUiBaseUrl(options: CacheAdminHtmlOptions): string {
   return DEFAULT_CACHE_ADMIN_UI_BASE_URL;
 }
 
-/** Thin HTML stub that loads remote CSS + ES module UI. */
+/** Thin HTML stub that loads the hosted CSS + ES module UI. */
 export function renderCacheAdminHtml(options: CacheAdminHtmlOptions = {}): string {
   const apiBase = options.apiBase ?? '';
   const uiBase = resolveUiBaseUrl(options);
@@ -79,8 +82,6 @@ export function renderCacheAdminHtml(options: CacheAdminHtmlOptions = {}): strin
       apiBase: ${escapeJsString(apiBase)},
       readOnly: ${options.readOnly === true ? 'true' : 'false'},
       defaults: {
-        username: ${escapeJsString(CACHE_ADMIN_DEFAULT_USERNAME)},
-        password: ${escapeJsString(CACHE_ADMIN_DEFAULT_PASSWORD)},
         ttlMinSeconds: ${CACHE_TTL_MIN_SECONDS},
         ttlMaxSeconds: ${CACHE_TTL_MAX_SECONDS},
         ttlDefaultSeconds: ${CACHE_TTL_DEFAULT_SECONDS},

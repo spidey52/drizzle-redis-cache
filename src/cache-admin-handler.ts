@@ -9,15 +9,15 @@ export type CacheAdminFetchHandler = (req: Request) => Promise<Response>;
 
 export type CacheAdminHandlerOptions = {
   basePath?: string;
-  /** Hosted `ui/` folder URL (no trailing slash). Defaults to jsDelivr `@main/ui`. */
+  /** Hosted `ui/` folder URL (no trailing slash). Defaults to the jsDelivr folder of this version. */
   uiBaseUrl?: string;
   /** @deprecated Use `uiBaseUrl`. */
   uiScriptUrl?: string;
   /**
-   * Enable CORS so a separately hosted UI (`ui/index.html?api=...`) can call the API.
-   * Reflects `Origin` when present.
+   * Allow a separately hosted UI (`ui/index.html?api=...`) to call the API from another origin.
+   * `true` reflects any origin; a list allows only those origins.
    */
-  cors?: boolean;
+  cors?: boolean | string[];
   /** When true, mutation endpoints (enable/TTL/credentials/flush) return 403. */
   readOnly?: boolean;
 };
@@ -29,12 +29,21 @@ function json(data: unknown, status = 200, headers?: HeadersInit): Response {
   });
 }
 
-function corsHeaders(req: Request, enabled: boolean): HeadersInit {
-  if (!enabled) return {};
-  const origin = req.headers.get('origin') || '*';
+type CorsPolicy = { allow: (origin: string | null) => string | null };
+
+function corsPolicy(option: boolean | string[] | undefined): CorsPolicy | null {
+  if (!option) return null;
+  if (option === true) return { allow: (origin) => origin || '*' };
+  const allowed = new Set(option.map((o) => o.replace(/\/$/, '')));
+  return { allow: (origin) => (origin && allowed.has(origin.replace(/\/$/, '')) ? origin : null) };
+}
+
+function corsHeaders(req: Request, policy: CorsPolicy | null): HeadersInit {
+  if (!policy) return {};
+  const origin = policy.allow(req.headers.get('origin'));
+  if (!origin) return {};
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     Vary: 'Origin',
@@ -64,7 +73,20 @@ function parseBasicAuth(header: string | null): { username: string; password: st
   }
 }
 
+/**
+ * 503 when no credentials exist anywhere (nothing is seeded), 401 when the request has none or
+ * wrong ones, null when the caller may proceed.
+ */
 async function requireAdmin(cache: DrizzleRedisCache, req: Request): Promise<Response | null> {
+  if ((await cache.getAdminCredentials()) == null) {
+    return json(
+      {
+        error:
+          'Admin credentials are not configured. Pass `adminCredentials` to DrizzleRedisCache or set them with setAdminCredentials().',
+      },
+      503,
+    );
+  }
   const creds = parseBasicAuth(req.headers.get('authorization'));
   if (!creds) {
     return json({ error: 'Missing Basic auth' }, 401, {
@@ -87,12 +109,11 @@ async function readBody<T>(req: Request): Promise<T | null> {
   }
 }
 
-function withCors(response: Response, req: Request, enabled: boolean): Response {
-  if (!enabled) return response;
+function withCors(response: Response, req: Request, policy: CorsPolicy | null): Response {
+  const extra = corsHeaders(req, policy);
+  if (Object.keys(extra).length === 0) return response;
   const headers = new Headers(response.headers);
-  for (const [k, v] of Object.entries(corsHeaders(req, true))) {
-    headers.set(k, v);
-  }
+  for (const [k, v] of Object.entries(extra)) headers.set(k, v);
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -111,7 +132,7 @@ export function createCacheAdminHandler(
   cache: DrizzleRedisCache,
   options: CacheAdminHandlerOptions = {},
 ): CacheAdminFetchHandler {
-  const cors = options.cors === true;
+  const cors = corsPolicy(options.cors);
   const readOnly = options.readOnly === true;
 
   return async (req) => {
@@ -121,11 +142,10 @@ export function createCacheAdminHandler(
 
     try {
       if (method === 'OPTIONS' && cors) {
-        return new Response(null, { status: 204, headers: corsHeaders(req, true) });
+        return new Response(null, { status: 204, headers: corsHeaders(req, cors) });
       }
 
       if (method === 'GET' && (path === '/' || path === '/index.html')) {
-        await cache.ensureAdminCredentials();
         const apiBase =
           (options.basePath ? options.basePath.replace(/\/$/, '') : '') ||
           url.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '');
@@ -144,18 +164,27 @@ export function createCacheAdminHandler(
         return withCors(json({ error: 'Not found' }, 404), req, cors);
       }
 
+      // the only unauthenticated endpoint: lets the UI tell "no credentials configured" from "sign in"
+      if (method === 'GET' && path === '/api/status') {
+        return withCors(
+          json({ configured: (await cache.getAdminCredentials()) != null, readOnly }),
+          req,
+          cors,
+        );
+      }
+
       const authError = await requireAdmin(cache, req);
       if (authError) return withCors(authError, req, cors);
 
       if (method === 'GET' && path === '/api') {
         const hours = parseHours(url.searchParams.get('hours'));
-        const [enabled, ttlSeconds, window, health, keyStats, tableIndexes] = await Promise.all([
+        const [enabled, ttlSeconds, window, health, keyStats, tableVersions] = await Promise.all([
           cache.isCacheEnabled(),
           cache.getDefaultTtlSeconds(),
           cache.getWindowStats(hours),
           cache.getHealth(),
           cache.getKeyStats(),
-          cache.getTableIndexStats(),
+          cache.getTableVersions(),
         ]);
         return withCors(
           json({
@@ -165,8 +194,12 @@ export function createCacheAdminHandler(
             stats: window.stats,
             health,
             keyStats,
-            tableIndexes,
+            config: cache.getConfig(),
+            tableVersions,
+            /** @deprecated v1 field; v2 has no per-table key index */
+            tableIndexes: tableVersions.map((v) => ({ ...v, queryKeys: 0 })),
             tableStats: window.tableStats,
+            tableHourly: window.tableHourly ?? {},
             readOnly,
           }),
           req,
@@ -176,6 +209,10 @@ export function createCacheAdminHandler(
 
       if (method === 'GET' && path === '/api/health') {
         return withCors(json({ ...(await cache.getHealth()), readOnly }), req, cors);
+      }
+
+      if (method === 'GET' && path === '/api/config') {
+        return withCors(json({ ...cache.getConfig(), readOnly }), req, cors);
       }
 
       if (method === 'POST' && path === '/api/latency-test') {

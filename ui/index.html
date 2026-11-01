@@ -23,16 +23,10 @@
   </div>
   <noscript>JavaScript is required. Pass your API as <code>?api=https://your-host/admin/cache</code>.</noscript>
   <script>
-    // Standalone: open with ?api=https://orders.example.com/admin/cache
+    // Standalone: open with ?api=https://orders.example.com/admin/cache (the server needs cors: [this origin])
     window.__DRIZZLE_CACHE_ADMIN__ = {
       apiBase: new URLSearchParams(location.search).get('api') || '',
-      defaults: {
-        username: 'admin',
-        password: 'admin',
-        ttlMinSeconds: 1,
-        ttlMaxSeconds: 3600,
-        ttlDefaultSeconds: 300,
-      },
+      defaults: { ttlMinSeconds: 1, ttlMaxSeconds: 3600, ttlDefaultSeconds: 300 },
     };
   </script>
   <script type="module" src="./app.js"></script>

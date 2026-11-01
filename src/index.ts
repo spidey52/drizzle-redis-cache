@@ -3,8 +3,7 @@
  *
  * Peer dependencies: **drizzle-orm**, **ioredis**
  *
- * Admin UI is loaded from a remote script (default jsDelivr). Update `ui/app.js`
- * on GitHub to ship UI changes without bumping this package.
+ * Admin UI is loaded from the `ui/` folder of this package's git tag (jsDelivr).
  */
 export {
   CACHE_ADMIN_DEFAULT_PASSWORD,
@@ -15,6 +14,8 @@ export {
   createRedisClient,
   DrizzleRedisCache,
   RedisHourlyStatsPlugin,
+  type CacheErrorOp,
+  type CacheSkipReason,
   type CacheStatsCollector,
   type CreateRedisClientConfig,
   type DrizzleRedisCacheOptions,
@@ -33,6 +34,7 @@ export {
 
 export {
   CACHE_ADMIN_HTML,
+  CACHE_ADMIN_UI_VERSION_TAG,
   DEFAULT_CACHE_ADMIN_UI_BASE_URL,
   DEFAULT_CACHE_ADMIN_UI_SCRIPT_URL,
   renderCacheAdminHtml,
